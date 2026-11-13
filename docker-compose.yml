@@ -1,0 +1,53 @@
+services:
+
+  # -------------------------------------------------------------------------
+  # PostgreSQL 17 with pgvector extension
+  # Port 5434 on the host so it does not clash with a local Postgres install.
+  # The volume persists all data across container restarts.
+  # -------------------------------------------------------------------------
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: rag_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: rag_database
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d rag_database"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # -------------------------------------------------------------------------
+  # Redis 7 — Celery broker (DB 0) and result backend (DB 1)
+  # Port 6379 on the host (standard Redis port).
+  # appendonly yes enables AOF persistence so queued tasks survive restarts.
+  # -------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: rag_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+

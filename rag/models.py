@@ -10,7 +10,57 @@ class Company(models.Model):
         return self.name
 
     
+
+class Document(models.Model):
+
+    class Status(models.TextChoices):
+        UPLOADED = "UPLOADED", "Uploaded"
+        QUEUED = "QUEUED", "Queued"
+        PROCESSING = "PROCESSING", "Processing"
+        READY = "READY", "Ready"
+        FAILED = "FAILED", "Failed"
+
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="documents",
+    )
+    uploaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        related_name="uploaded_documents",
+        null=True,
+        blank=True,
+    )
+    original_filename = models.CharField(max_length=255)
+    file = models.FileField(upload_to="documents/%Y/%m/%d/", max_length=500)
+    file_hash = models.CharField(max_length=64, db_index=True)
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.UPLOADED,
+        db_index=True,
+    )
+    error_message = models.TextField(blank=True, default="")
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.original_filename} ({self.status}) - {self.company}"
+
+
 class DocumentParent(models.Model):
+    document = models.ForeignKey(
+        Document,
+        on_delete=models.CASCADE,
+        related_name="parent_records",
+        null=True,
+        blank=True,
+    )
     company = models.ForeignKey(
         Company,
         on_delete=models.CASCADE,
@@ -28,6 +78,13 @@ class DocumentParent(models.Model):
 
     
 class DocumentChunk(models.Model):
+    document = models.ForeignKey(
+        Document,
+        on_delete=models.CASCADE,
+        related_name="chunks",
+        null=True,
+        blank=True,
+    )
     company = models.ForeignKey(
         Company,
         on_delete=models.CASCADE,

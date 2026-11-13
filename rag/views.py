@@ -1,51 +1,54 @@
-import tempfile
+import hashlib
 from pathlib import Path
 
-from aiohttp import request
-
-from rest_framework import status
+import pymupdf
+from django.conf import settings
+from django.contrib.auth import get_user_model
+from django.contrib.postgres.search import SearchQuery, SearchRank, SearchVector
+from django.db import transaction
+from langchain_community.document_loaders import PyMuPDFLoader
+from pgvector.django import CosineDistance
+from rest_framework import generics, status
+from rest_framework.authentication import SessionAuthentication, TokenAuthentication
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework import generics
-from rest_framework.permissions import AllowAny
-from langchain_community.document_loaders import PyMuPDFLoader
 
-from .services.cleaner import clean_documents
-from .services.chunker import chunk_documents
-from .services.embedding import embed_documents,embed_query
-from .models import DocumentChunk, DocumentParent,Company
-from pgvector.django import CosineDistance
-from .services.llm import generate_answer,reciprocal_rank_fusion
-from .services.reranker import rerank_results
 from rag.services.parent_retrieval import retrieve_parent_documents
-from django.contrib.postgres.search import SearchQuery, SearchRank, SearchVector
+from .models import Company, Document, DocumentChunk, DocumentParent, UserProfile
 from .serializers import CompanySerializer, UserCreateSerializer
-from django.contrib.auth import get_user_model
+from .services.chunker import chunk_documents
+from .services.cleaner import clean_documents
+from .services.embedding import embed_documents, embed_query
+from .services.llm import generate_answer, reciprocal_rank_fusion
+from .services.pipeline import PipelineError, process_document
+from .services.reranker import rerank_results
+
+
 def load_pdf(file_path: str | Path):
     """Load a PDF into LangChain documents, one document per page."""
     return PyMuPDFLoader(str(file_path)).load()
 
 
 class PDFUploadView(APIView):
-    """Receive a PDF from the dashboard and load it into LangChain documents."""
+    """Receive a PDF, securely validate tenant ownership, and process document chunks."""
 
-    
+    authentication_classes = [TokenAuthentication, SessionAuthentication]
+    permission_classes = [IsAuthenticated]
+
     def post(self, request, *args, **kwargs):
-        uploaded_file = request.FILES.get("file")
+        # 1. Resolve tenant ownership from UserProfile
+        if not hasattr(request.user, "profile") or request.user.profile.company is None:
+            return Response(
+                {"detail": "Authenticated user has no associated company profile."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        company = request.user.profile.company
+
+        # 2. Extract and validate required metadata
         department = request.data.get("department")
         document_type = request.data.get("document_type")
-
-        if uploaded_file is None:
-            return Response(
-                {"detail": "Upload a PDF using the 'file' field."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        if not uploaded_file.name.lower().endswith(".pdf"):
-            return Response(
-                {"detail": "Only PDF files are supported."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
 
         if not department:
             return Response(
@@ -59,109 +62,133 @@ class PDFUploadView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        temporary_path = None
-
-        try:
-            with tempfile.NamedTemporaryFile(
-                suffix=".pdf",
-                delete=False
-            ) as temporary_file:
-
-                temporary_path = Path(temporary_file.name)
-
-                for file_chunk in uploaded_file.chunks():
-                    temporary_file.write(file_chunk)
-
-            # 1. Load PDF
-            documents = load_pdf(temporary_path)
-
-            # 2. Clean extracted text
-            documents = clean_documents(documents)
-
-            # 3. Split into parent and child chunks
-            parent_child_documents = chunk_documents(
-                documents,
-                department=department,
+        # 3. Validate uploaded file
+        uploaded_file = request.FILES.get("file")
+        if uploaded_file is None:
+            return Response(
+                {"detail": "Upload a PDF using the 'file' field."},
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
-            # 4. Extract child documents
-            child_documents = []
+        if not uploaded_file.name.lower().endswith(".pdf"):
+            return Response(
+                {"detail": "Only PDF files are supported."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-            for item in parent_child_documents:
-                child_documents.extend(item["children"])
+        max_size = getattr(settings, "MAX_UPLOAD_SIZE_BYTES", 15 * 1024 * 1024)
+        if uploaded_file.size > max_size:
+            return Response(
+                {
+                    "detail": f"File size exceeds the maximum allowed limit ({max_size // (1024 * 1024)}MB)."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-            # 5. Generate embeddings for children only
-            embeddings = embed_documents(child_documents)
+        # Read first bytes to verify %PDF- signature and compute hash
+        sha256 = hashlib.sha256()
+        header = None
+        for chunk in uploaded_file.chunks():
+            if header is None:
+                header = chunk[:5]
+            sha256.update(chunk)
+        file_hash = sha256.hexdigest()
 
-            # 6. Create metadata for this document
-            metadata = {
+        if not header or not header.startswith(b"%PDF-"):
+            return Response(
+                {"detail": "Invalid PDF file signature."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        uploaded_file.seek(0)
+
+        # Validate parseability with PyMuPDF
+        try:
+            pdf_bytes = uploaded_file.read()
+            uploaded_file.seek(0)
+            doc_test = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+            if doc_test.page_count == 0:
+                doc_test.close()
+                return Response(
+                    {"detail": "The uploaded PDF contains no readable pages."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            doc_test.close()
+        except Exception:
+            uploaded_file.seek(0)
+            return Response(
+                {"detail": "The uploaded file could not be parsed as a valid PDF."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # 4. Create Document record in PROCESSING status and persist file
+        document = Document.objects.create(
+            company=company,
+            uploaded_by=request.user,
+            original_filename=uploaded_file.name,
+            file=uploaded_file,
+            file_hash=file_hash,
+            status=Document.Status.PROCESSING,
+            metadata={
                 "department": department,
                 "document_type": document_type,
-            }
+            },
+        )
 
-            # 7. Store parents, children, and embeddings
-            embedding_index = 0
+        # 5. Ingestion execution delegated to pipeline service
+        try:
+            result = process_document(document)
+            document.refresh_from_db()  # Sync stale in-memory status with the committed DB value
 
-            for item in parent_child_documents:
+            return Response(
+                {
+                    "document_id": document.id,
+                    "status": document.status,
+                    "filename": uploaded_file.name,
+                    "department": department,
+                    "document_type": document_type,
+                    "parents_stored": result["parents_stored"],
+                    "children_stored": result["children_stored"],
+                },
+                status=status.HTTP_200_OK,
+            )
 
-                parent_document = item["parent"]
-                children = item["children"]
-
-                # Create parent
-                parent = DocumentParent.objects.create(
-                    source_filename=uploaded_file.name,
-                    content=parent_document.page_content,
-                    metadata={
-                        **parent_document.metadata,
-                        **metadata,
-                    },
-                )
-
-                # Create children
-                for child in children:
-
-                    embedding = embeddings[embedding_index]
-                    embedding_index += 1
-
-                    DocumentChunk.objects.create(
-                        parent=parent,
-                        source_filename=uploaded_file.name,
-                        content=child.page_content,
-                        metadata={
-                            **child.metadata,
-                            **metadata,
-                        },
-                        embedding=embedding,
-                    )
-
-        except Exception as e:
-            print("Exception:", str(e))
-
+        except PipelineError:
+            return Response(
+                {"detail": "The uploaded file could not be processed."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except Exception:
             return Response(
                 {"detail": "The uploaded file could not be processed."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        finally:
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
 
-        return Response(
-            {
-                "filename": uploaded_file.name,
-                "department": department,
-                "document_type": document_type,
-                "parents_stored": len(parent_child_documents),
-                "children_stored": len(child_documents),
-            },
-            status=status.HTTP_200_OK,
-        )
 
 
 class ChunksRetrieveView(APIView):
-    """Retrieve document chunks from PostgreSQL based on department and document type."""
+    """Retrieve document chunks from PostgreSQL based on department and document type.
+
+    Requires authentication. All database queries are scoped to the authenticated
+    user's company at the ORM level before results enter RRF or reranking.
+    Legacy records with company=NULL are excluded automatically by the equality
+    filter (SQL equality never matches NULL).
+    """
+
+    authentication_classes = [TokenAuthentication, SessionAuthentication]
+    permission_classes = [IsAuthenticated]
 
     def get(self, request, *args, **kwargs):
+        # 0. Resolve tenant ownership from UserProfile -- never trust a client-supplied ID
+        if not hasattr(request.user, "profile") or request.user.profile.company is None:
+            return Response(
+                {"detail": "Authenticated user has no associated company profile."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        company = request.user.profile.company
+
         department = request.query_params.get("department")
         query = request.query_params.get("query")
 
@@ -180,10 +207,13 @@ class ChunksRetrieveView(APIView):
         # 1. Convert user's query into an embedding
         query_embedding = embed_query(query)
 
-        # 2. Vector / semantic search
+        # 2. Vector / semantic search -- scoped to the authenticated user's company.
+        #    Chunks from other companies and legacy records (company=NULL) are
+        #    excluded at the database level before any scoring occurs.
         vector_chunks = (
             DocumentChunk.objects
             .filter(
+                company=company,
                 metadata__department=department,
                 embedding__isnull=False,
             )
@@ -193,12 +223,13 @@ class ChunksRetrieveView(APIView):
             .order_by("distance")[:10]
         )
 
-        # 3. Keyword / full-text search
+        # 3. Keyword / full-text search -- same company scope as vector search.
         search_query = SearchQuery(query)
 
         keyword_chunks = (
             DocumentChunk.objects
             .filter(
+                company=company,
                 metadata__department=department,
                 embedding__isnull=False,
             )
@@ -302,7 +333,11 @@ class RerankerTestView(APIView):
 class ParentDocumentView(APIView):
     """Retrieve parent documents based on child results."""
 
+    authentication_classes = [TokenAuthentication, SessionAuthentication]
+    permission_classes = [IsAuthenticated]
+
     def post(self, request, *args, **kwargs):
+        # --- Input validation (does not require company context) ---
         child_ids = request.data.get("child_ids")
 
         if not isinstance(child_ids, list) or not child_ids:
@@ -330,9 +365,17 @@ class ParentDocumentView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Load the actual child records from the database.
+        # --- Resolve tenant company from authenticated user ---
+        if not hasattr(request.user, "profile") or request.user.profile.company is None:
+            return Response(
+                {"detail": "Authenticated user has no associated company profile."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        company = request.user.profile.company
+
+        # Load only child records belonging to this tenant.
         children = DocumentChunk.objects.filter(
-            id__in=child_ids
+            id__in=child_ids, company=company
         ).select_related("parent")
 
         child_results = [

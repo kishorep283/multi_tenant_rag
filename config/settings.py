@@ -40,6 +40,8 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'rest_framework',
+    'rest_framework.authtoken',
     'rag'
 ]
 
@@ -151,3 +153,58 @@ MAILERS = {
         'BACKEND': 'django.core.mail.backends.console.EmailBackend',
     },
 }
+
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'rest_framework.authentication.TokenAuthentication',
+        'rest_framework.authentication.SessionAuthentication',
+    ],
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.AllowAny',
+    ],
+}
+
+MEDIA_URL = 'media/'
+MEDIA_ROOT = BASE_DIR / 'media'
+MAX_UPLOAD_SIZE_BYTES = 15 * 1024 * 1024  # 15 MB
+
+# ---------------------------------------------------------------------------
+# Celery configuration
+# All keys are read from environment variables so no secrets are hardcoded.
+# ---------------------------------------------------------------------------
+
+# Broker: Redis.  Default points to the Docker Compose service name on the
+# standard Redis port.  Override via CELERY_BROKER_URL in .env or environment.
+CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
+
+# Result backend: same Redis instance, different database number so task
+# results are logically separated from the broker queue.
+CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/1")
+
+# Serialization — JSON is safe and human-readable.
+CELERY_TASK_SERIALIZER = "json"
+CELERY_RESULT_SERIALIZER = "json"
+CELERY_ACCEPT_CONTENT = ["json"]
+
+# Timezone — keep consistent with Django.
+CELERY_TIMEZONE = TIME_ZONE
+CELERY_ENABLE_UTC = True
+
+# Task result TTL (1 hour default).  Results are only kept for verification;
+# the authoritative state lives on the Document model.
+CELERY_RESULT_EXPIRES = int(os.getenv("CELERY_RESULT_EXPIRES", 3600))
+
+# Worker concurrency: default to 2 to avoid overwhelming the GPU/CPU on the
+# embedding model.  Override via CELERY_WORKER_CONCURRENCY.
+CELERY_WORKER_CONCURRENCY = int(os.getenv("CELERY_WORKER_CONCURRENCY", 2))
+
+# Task routing — use a dedicated queue for document ingestion (Week 2).
+CELERY_TASK_DEFAULT_QUEUE = "default"
+
+# Acknowledge the task only after it has finished (not just received).
+# This prevents silent loss if the worker crashes mid-task.
+CELERY_TASK_ACKS_LATE = True
+
+# Reject tasks that cannot be retried back to the queue instead of discarding.
+CELERY_TASK_REJECT_ON_WORKER_LOST = True
+

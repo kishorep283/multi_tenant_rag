@@ -12,6 +12,12 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
+        # Ensure the pgvector extension exists before any VectorField column is created.
+        # IF NOT EXISTS makes this idempotent on production and test databases alike.
+        migrations.RunSQL(
+            sql="CREATE EXTENSION IF NOT EXISTS vector;",
+            reverse_sql=migrations.RunSQL.noop,
+        ),
         migrations.CreateModel(
             name='DocumentChunk',
             fields=[
