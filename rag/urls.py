@@ -8,6 +8,7 @@ from .views import (
     ParentDocumentView,
     RerankerTestView,
     UserCreateView,
+    DocumentStatusView
 )
 
 
@@ -19,5 +20,6 @@ urlpatterns = [
     path("documents/parent", ParentDocumentView.as_view(), name="documents-parent"),
     path("companies/", CompanyListCreateView.as_view(), name="companies"),
     path("users/create/", UserCreateView.as_view(), name="users-create"),
+    path("documents/<int:document_id>/status/", DocumentStatusView.as_view(), name="document-status"),
 ]
 

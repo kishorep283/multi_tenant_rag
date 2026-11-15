@@ -21,4 +21,5 @@ urlpatterns = [
     path('admin/', admin.site.urls),
     path('home/', home, name='home'),
     path('rag/', include('rag.urls')),
+    path('api/accounts/', include('accounts.urls')),
 ]

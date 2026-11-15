@@ -7,7 +7,8 @@ Week 1: Contains only a simple health-check / smoke-test task.
 
 from celery import shared_task
 
-
+from rag.models import Document
+from rag.services.pipeline import process_document, PipelineError
 @shared_task(bind=True, name="rag.tasks.health_check")
 def health_check(self, payload: str = "ping") -> dict:
     """
@@ -30,4 +31,33 @@ def health_check(self, payload: str = "ping") -> dict:
         "echo": payload,
         "worker": self.request.hostname,
     }
+
+@shared_task(bind=True, name="rag.tasks.ingest_document")
+def ingest_document(self, document_id: int) -> dict:
+    """
+    Process a persisted PDF document asynchronously.
+    """
+    try:
+        document = Document.objects.get(pk=document_id)
+
+    except Document.DoesNotExist:
+        return {
+            "document_id": document_id,
+            "status": "NOT_FOUND",
+        }
+
+    try:
+        result = process_document(document)
+
+        return {
+            "document_id": document_id,
+            "status": "READY",
+            **result,
+        }
+
+    except PipelineError:
+        return {
+            "document_id": document_id,
+            "status": "FAILED",
+        }
 

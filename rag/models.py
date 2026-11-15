@@ -117,6 +117,7 @@ class UserProfile(models.Model):
     class Role(models.TextChoices):
         OWNER = "OWNER", "Owner"
         ADMIN = "ADMIN", "Admin"
+        SUBADMIN = "SUBADMIN", "Sub Admin"
         MEMBER = "MEMBER", "Member"
 
     user = models.OneToOneField(

@@ -1,6 +1,6 @@
 from rag.models import DocumentParent
 
-def retrieve_parent_documents(child_results):
+def retrieve_parent_documents(child_results,company):
     """
     Retrieve unique parent documents from ranked child results.
     """
@@ -19,7 +19,8 @@ def retrieve_parent_documents(child_results):
 
     # 2. Fetch all matching parents in one database query.
     parents = DocumentParent.objects.filter(
-        id__in=parent_ids
+        id__in=parent_ids,
+        company=company
     )
 
     # 3. Create a lookup for the retrieved parents.

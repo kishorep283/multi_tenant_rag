@@ -23,8 +23,10 @@ from .services.embedding import embed_documents, embed_query
 from .services.llm import generate_answer, reciprocal_rank_fusion
 from .services.pipeline import PipelineError, process_document
 from .services.reranker import rerank_results
-
-
+from django.db import transaction
+from rag.tasks import ingest_document
+from rag.services.retrieval import retrieve_chunks
+from accounts.permissions import CanManageCompanyDocuments
 def load_pdf(file_path: str | Path):
     """Load a PDF into LangChain documents, one document per page."""
     return PyMuPDFLoader(str(file_path)).load()
@@ -34,7 +36,7 @@ class PDFUploadView(APIView):
     """Receive a PDF, securely validate tenant ownership, and process document chunks."""
 
     authentication_classes = [TokenAuthentication, SessionAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [CanManageCompanyDocuments]
 
     def post(self, request, *args, **kwargs):
         # 1. Resolve tenant ownership from UserProfile
@@ -135,53 +137,42 @@ class PDFUploadView(APIView):
             },
         )
 
-        # 5. Ingestion execution delegated to pipeline service
-        try:
-            result = process_document(document)
-            document.refresh_from_db()  # Sync stale in-memory status with the committed DB value
+        # 5. Schedule ingestion after the Document record is committed
+        transaction.on_commit(
+            lambda: ingest_document.delay(document.id)
+        )
 
-            return Response(
-                {
-                    "document_id": document.id,
-                    "status": document.status,
-                    "filename": uploaded_file.name,
-                    "department": department,
-                    "document_type": document_type,
-                    "parents_stored": result["parents_stored"],
-                    "children_stored": result["children_stored"],
-                },
-                status=status.HTTP_200_OK,
-            )
-
-        except PipelineError:
-            return Response(
-                {"detail": "The uploaded file could not be processed."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        except Exception:
-            return Response(
-                {"detail": "The uploaded file could not be processed."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        return Response(
+            {
+                "document_id": document.id,
+                "status": document.status,
+                "filename": uploaded_file.name,
+                "department": department,
+                "document_type": document_type,
+                "detail": "Document uploaded successfully. Ingestion has been queued.",
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )
 
 
 
 
 class ChunksRetrieveView(APIView):
-    """Retrieve document chunks from PostgreSQL based on department and document type.
-
-    Requires authentication. All database queries are scoped to the authenticated
-    user's company at the ORM level before results enter RRF or reranking.
-    Legacy records with company=NULL are excluded automatically by the equality
-    filter (SQL equality never matches NULL).
+    """
+    Retrieve relevant document chunks for the authenticated user's company,
+    retrieve parent documents, and generate an answer.
     """
 
     authentication_classes = [TokenAuthentication, SessionAuthentication]
     permission_classes = [IsAuthenticated]
 
     def get(self, request, *args, **kwargs):
-        # 0. Resolve tenant ownership from UserProfile -- never trust a client-supplied ID
-        if not hasattr(request.user, "profile") or request.user.profile.company is None:
+
+        # 1. Resolve tenant from authenticated user
+        if (
+            not hasattr(request.user, "profile")
+            or request.user.profile.company is None
+        ):
             return Response(
                 {"detail": "Authenticated user has no associated company profile."},
                 status=status.HTTP_403_FORBIDDEN,
@@ -189,6 +180,7 @@ class ChunksRetrieveView(APIView):
 
         company = request.user.profile.company
 
+        # 2. Validate query parameters
         department = request.query_params.get("department")
         query = request.query_params.get("query")
 
@@ -204,88 +196,32 @@ class ChunksRetrieveView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # 1. Convert user's query into an embedding
-        query_embedding = embed_query(query)
-
-        # 2. Vector / semantic search -- scoped to the authenticated user's company.
-        #    Chunks from other companies and legacy records (company=NULL) are
-        #    excluded at the database level before any scoring occurs.
-        vector_chunks = (
-            DocumentChunk.objects
-            .filter(
-                company=company,
-                metadata__department=department,
-                embedding__isnull=False,
-            )
-            .annotate(
-                distance=CosineDistance("embedding", query_embedding)
-            )
-            .order_by("distance")[:10]
-        )
-
-        # 3. Keyword / full-text search -- same company scope as vector search.
-        search_query = SearchQuery(query)
-
-        keyword_chunks = (
-            DocumentChunk.objects
-            .filter(
-                company=company,
-                metadata__department=department,
-                embedding__isnull=False,
-            )
-            .annotate(
-                search_vector=SearchVector("content"),
-                rank=SearchRank(
-                    SearchVector("content"),
-                    search_query,
-                ),
-            )
-            .filter(search_vector=search_query)
-            .order_by("-rank")[:10]
-        )
-
-        # 4. Serialize vector search results
-        vector_results = [
-            {
-                "id": chunk.id,
-                "parent_id": chunk.parent_id,
-                "source_filename": chunk.source_filename,
-                "content": chunk.content,
-                "metadata": chunk.metadata,
-                "distance": float(chunk.distance),
-            }
-            for chunk in vector_chunks
-        ]
-
-        # 5. Serialize keyword search results
-        keyword_results = [
-            {
-                "id": chunk.id,
-                "parent_id": chunk.parent_id,
-                "source_filename": chunk.source_filename,
-                "content": chunk.content,
-                "metadata": chunk.metadata,
-                "rank": float(chunk.rank),
-            }
-            for chunk in keyword_chunks
-        ]
-        reranked_results = reciprocal_rank_fusion(
-            vector_results,
-            keyword_results,
-        )
-        reranked_results = rerank_results(
+        # 3. Retrieve chunks using the reusable retrieval service
+        retrieval_results = retrieve_chunks(
             query=query,
-            results=reranked_results,
+            company=company,
+            department=department,
             top_k=5,
         )
+
+        reranked_results = retrieval_results["reranked_results"]
+
+        # 4. Retrieve parent documents
         parent_documents = retrieve_parent_documents(
-            reranked_results
+            reranked_results,
+            company,
         )
+
+        # 5. Build context for LLM
         context = "\n\n".join(
             parent["content"]
             for parent in parent_documents
         )
-        answer = generate_answer(query,context)
+
+        # 6. Generate answer
+        answer = generate_answer(query, context)
+
+        # 7. Return response
         return Response(
             {
                 "query": query,
@@ -387,7 +323,7 @@ class ParentDocumentView(APIView):
         ]
 
         # Retrieve the corresponding unique parent documents.
-        parents = retrieve_parent_documents(child_results)
+        parents = retrieve_parent_documents(child_results,company)
 
         return Response(
             {
@@ -409,3 +345,37 @@ class UserCreateView(generics.CreateAPIView):
     queryset = User.objects.all()
     serializer_class = UserCreateSerializer
     permission_classes = [AllowAny]
+
+class DocumentStatusView(APIView):
+
+    authentication_classes = [
+        TokenAuthentication,
+        SessionAuthentication,
+    ]
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, document_id):
+
+        company = request.user.profile.company
+
+        document = Document.objects.filter(
+            id=document_id,
+            company=company
+        ).first()
+
+        if document is None:
+            return Response(
+                {"detail": "Document not found."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        return Response({
+            "document_id": document.id,
+            "filename": document.original_filename,
+            "status": document.status,
+            "department": document.metadata.get("department"),
+            "document_type": document.metadata.get("document_type"),
+            "error_message": document.error_message,
+            "created_at": document.created_at,
+        })
