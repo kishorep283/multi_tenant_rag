@@ -9,6 +9,10 @@ from celery import shared_task
 
 from rag.models import Document
 from rag.services.pipeline import process_document, PipelineError
+import logging
+
+logger = logging.getLogger(__name__)
+
 @shared_task(bind=True, name="rag.tasks.health_check")
 def health_check(self, payload: str = "ping") -> dict:
     """
@@ -56,8 +60,8 @@ def ingest_document(self, document_id: int) -> dict:
         }
 
     except PipelineError:
-        return {
-            "document_id": document_id,
-            "status": "FAILED",
-        }
-
+        logger.exception(
+            "Celery ingestion task failed for document %s",
+            document_id,
+        )
+        raise

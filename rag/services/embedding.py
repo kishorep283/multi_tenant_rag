@@ -9,14 +9,44 @@ embedding_model = HuggingFaceEmbeddings(
 print(">>> AFTER EMBEDDING MODEL")
 
 def embed_documents(documents):
-    """Generate embeddings for a list of LangChain Documents."""
+    """Generate and validate embeddings for LangChain Documents."""
+
+    if not documents:
+        raise ValueError("Cannot generate embeddings for an empty document list.")
 
     texts = [document.page_content for document in documents]
 
-    return embedding_model.embed_documents(texts)
+    try:
+        embeddings = embedding_model.embed_documents(texts)
+
+        validate_embeddings(
+            embeddings=embeddings,
+            expected_count=len(texts),
+        )
+
+        return embeddings
+
+    except Exception as e:
+        raise RuntimeError("Document embedding generation failed.") from e
 
 def embed_query(query: str):
-    return embedding_model.embed_query(query)
+    """Generate and validate an embedding for a query."""
+
+    if not query or not query.strip():
+        raise ValueError("Query cannot be empty.")
+
+    try:
+        embeddings = embedding_model.embed_query(query)
+
+        validate_embeddings(
+            embeddings=[embeddings],
+            expected_count=1,
+        )
+
+        return embeddings
+
+    except Exception as e:
+        raise RuntimeError("Query embedding generation failed.") from e
 
 
 def validate_embeddings(
@@ -48,4 +78,4 @@ def validate_embeddings(
             if not isinstance(val, (int, float)) or math.isnan(val) or math.isinf(val):
                 raise ValueError(
                     f"Non-numeric, NaN, or infinite value detected at vector {i}, dimension {j}: {val}."
-                )
+                )

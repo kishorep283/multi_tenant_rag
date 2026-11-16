@@ -5,7 +5,11 @@ from openai import OpenAI
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=settings.OPENROUTER_API_KEY,
+    timeout=30.0,
 )
+
+
+from openai import APIError, APIConnectionError, APITimeoutError
 
 
 def generate_answer(question: str, context: str) -> str:
@@ -28,17 +32,32 @@ def generate_answer(question: str, context: str) -> str:
     Answer:
     """
 
-    response = client.chat.completions.create(
-        model=settings.OPENROUTER_MODEL,
-        messages=[
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ],
-    )
+    try:
+        response = client.chat.completions.create(
+            model=settings.OPENROUTER_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
+        )
 
-    return response.choices[0].message.content
+        answer = response.choices[0].message.content
+
+        if not answer or not answer.strip():
+            raise ValueError("LLM returned an empty response.")
+
+        return answer.strip()
+
+    except APITimeoutError as e:
+        raise RuntimeError("LLM request timed out.") from e
+
+    except APIConnectionError as e:
+        raise RuntimeError("Unable to connect to the LLM provider.") from e
+
+    except APIError as e:
+        raise RuntimeError("LLM provider returned an API error.") from e
 
 def reciprocal_rank_fusion(
     vector_results,

@@ -197,12 +197,21 @@ class ChunksRetrieveView(APIView):
             )
 
         # 3. Retrieve chunks using the reusable retrieval service
-        retrieval_results = retrieve_chunks(
-            query=query,
-            company=company,
-            department=department,
-            top_k=5,
-        )
+        try:
+            retrieval_results = retrieve_chunks(
+                query=query,
+                company=company,
+                department=department,
+                top_k=5,
+            )
+
+        except RuntimeError:
+            return Response(
+                {
+                    "detail": "The retrieval service is temporarily unavailable. Please try again later."
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
 
         reranked_results = retrieval_results["reranked_results"]
 
@@ -219,7 +228,16 @@ class ChunksRetrieveView(APIView):
         )
 
         # 6. Generate answer
-        answer = generate_answer(query, context)
+        try:
+            answer = generate_answer(query, context)
+
+        except RuntimeError:
+            return Response(
+                {
+                    "detail": "The answer generation service is temporarily unavailable. Please try again later."
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
 
         # 7. Return response
         return Response(
