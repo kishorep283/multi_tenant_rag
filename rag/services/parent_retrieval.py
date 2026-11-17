@@ -1,6 +1,6 @@
 from rag.models import DocumentParent
 
-def retrieve_parent_documents(child_results,company):
+def retrieve_parent_documents(child_results,company,min_relevance_score=0.1):
     """
     Retrieve unique parent documents from ranked child results.
     """
@@ -10,7 +10,10 @@ def retrieve_parent_documents(child_results,company):
         dict.fromkeys(
             result["parent_id"]
             for result in child_results
-            if result.get("parent_id") is not None
+            if (
+                result.get("parent_id") is not None
+                and result.get("reranker_score", 0) >= min_relevance_score
+            )
         )
     )
 

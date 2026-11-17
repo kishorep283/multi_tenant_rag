@@ -27,6 +27,8 @@ from django.db import transaction
 from rag.tasks import ingest_document
 from rag.services.retrieval import retrieve_chunks
 from accounts.permissions import CanManageCompanyDocuments
+from rag.services.context_builder import build_context
+from rag.services.context_compression import compress_documents
 def load_pdf(file_path: str | Path):
     """Load a PDF into LangChain documents, one document per page."""
     return PyMuPDFLoader(str(file_path)).load()
@@ -205,13 +207,15 @@ class ChunksRetrieveView(APIView):
                 top_k=5,
             )
 
-        except RuntimeError:
-            return Response(
-                {
-                    "detail": "The retrieval service is temporarily unavailable. Please try again later."
-                },
-                status=status.HTTP_503_SERVICE_UNAVAILABLE,
-            )
+        except RuntimeError as exc:
+            print(f"Retrieval service error: {exc}")
+            raise
+            # return Response(
+            #     {
+            #         "detail": "The retrieval service is temporarily unavailable. Please try again later."
+            #     },
+            #     status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            # )
 
         reranked_results = retrieval_results["reranked_results"]
 
@@ -221,25 +225,40 @@ class ChunksRetrieveView(APIView):
             company,
         )
 
-        # 5. Build context for LLM
-        context = "\n\n".join(
-            parent["content"]
-            for parent in parent_documents
-        )
-
-        # 6. Generate answer
+        # 5. Compress parent documents based on the user's query
         try:
-            answer = generate_answer(query, context)
+            compressed_documents = compress_documents(
+                question=query,
+                parent_documents=parent_documents,
+            )
 
-        except RuntimeError:
+        except RuntimeError as exc:
+            print(f"Context compression service error: {exc}")
             return Response(
                 {
-                    "detail": "The answer generation service is temporarily unavailable. Please try again later."
+                    "detail": "The context compression service is temporarily unavailable."
                 },
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
 
-        # 7. Return response
+        # 6. Build context from compressed documents
+        context, context_tokens = build_context(compressed_documents)
+
+        # 7. Generate answer
+        try:
+            answer = generate_answer(query, context)
+
+        except RuntimeError as exc:
+            print(f"Answer generation service error: {exc}")
+            raise
+            # return Response(
+            #     {
+            #         "detail": "The answer generation service is temporarily unavailable. Please try again later."
+            #     },
+            #     status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            # )
+
+        # 8. Return response
         return Response(
             {
                 "query": query,
