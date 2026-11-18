@@ -209,3 +209,30 @@ CELERY_TASK_ACKS_LATE = True
 # Reject tasks that cannot be retried back to the queue instead of discarding.
 CELERY_TASK_REJECT_ON_WORKER_LOST = True
 
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "standard": {
+            "format": (
+                "{asctime} {levelname} {name} "
+                "{message}"
+            ),
+            "style": "{",
+        },
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "standard",
+        },
+    },
+    "loggers": {
+        "rag": {
+            "handlers": ["console"],
+            "level": "INFO",
+            "propagate": False,
+        },
+    },
+}

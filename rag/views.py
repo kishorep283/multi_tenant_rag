@@ -29,6 +29,9 @@ from rag.services.retrieval import retrieve_chunks
 from accounts.permissions import CanManageCompanyDocuments
 from rag.services.context_builder import build_context
 from rag.services.context_compression import compress_documents
+from rag.services.observability import StageTimer,generate_request_id
+import logging
+logger = logging.getLogger(__name__)
 def load_pdf(file_path: str | Path):
     """Load a PDF into LangChain documents, one document per page."""
     return PyMuPDFLoader(str(file_path)).load()
@@ -169,7 +172,6 @@ class ChunksRetrieveView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, *args, **kwargs):
-
         # 1. Resolve tenant from authenticated user
         if (
             not hasattr(request.user, "profile")
@@ -197,8 +199,12 @@ class ChunksRetrieveView(APIView):
                 {"detail": "The 'query' query parameter is required."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        request_id = generate_request_id()
+        timer = StageTimer()
+        total_start = timer.start()
 
         # 3. Retrieve chunks using the reusable retrieval service
+        stage_start = timer.start()
         try:
             retrieval_results = retrieve_chunks(
                 query=query,
@@ -210,6 +216,8 @@ class ChunksRetrieveView(APIView):
         except RuntimeError as exc:
             print(f"Retrieval service error: {exc}")
             raise
+        finally:
+            timer.stop("retrieval", stage_start)
             # return Response(
             #     {
             #         "detail": "The retrieval service is temporarily unavailable. Please try again later."
@@ -220,12 +228,14 @@ class ChunksRetrieveView(APIView):
         reranked_results = retrieval_results["reranked_results"]
 
         # 4. Retrieve parent documents
+        stage_start = timer.start()
         parent_documents = retrieve_parent_documents(
             reranked_results,
             company,
         )
-
+        timer.stop("parent_retrieval", stage_start)
         # 5. Compress parent documents based on the user's query
+        stage_start = timer.start()
         try:
             compressed_documents = compress_documents(
                 question=query,
@@ -240,11 +250,15 @@ class ChunksRetrieveView(APIView):
                 },
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
+        finally:
+            timer.stop("compression", stage_start)
 
         # 6. Build context from compressed documents
+        stage_start = timer.start()
         context, context_tokens = build_context(compressed_documents)
-
+        timer.stop("context_building", stage_start)
         # 7. Generate answer
+        stage_start = timer.start()
         try:
             answer = generate_answer(query, context)
 
@@ -257,13 +271,25 @@ class ChunksRetrieveView(APIView):
             #     },
             #     status=status.HTTP_503_SERVICE_UNAVAILABLE,
             # )
-
+        finally:
+            timer.stop("answer_generation", stage_start)
         # 8. Return response
+        total_latency = timer.stop("total_latency", total_start)
+        logger.info(
+            "RAG request completed | request_id=%s | latency_ms=%s",
+            request_id,
+            total_latency,
+        )
         return Response(
             {
                 "query": query,
                 "department": department,
                 "answer": answer,
+                "observability": {
+                    "request_id": request_id,
+                    "stages": timer.stages,
+                    "total_latency_ms": total_latency,
+                },
                 "reranked_results": reranked_results,
                 "parent_documents": parent_documents,
             },
